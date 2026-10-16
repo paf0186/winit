@@ -131,6 +131,10 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// True while `keyDown:` is running `interpretKeyEvents`, so text input callbacks can tell
+    /// keyboard-driven text from text inserted by other input sources (e.g. dictation).
+    in_key_down: Cell<bool>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -262,8 +266,11 @@ declare_class!(
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
-            // Documented to return `{NSNotFound, 0}` if there is no selection.
-            NSRange::new(NSNotFound as NSUInteger, 0)
+            // Report an empty selection at the caret (the end of any marked text). Returning
+            // `{NSNotFound, 0}` makes macOS dictation treat the view as having no insertion
+            // point, and it then drops the dictated text.
+            let length = self.ivars().marked_text.borrow().length();
+            NSRange::new(length, 0)
         }
 
         #[method(setMarkedText:selectedRange:replacementRange:)]
@@ -401,11 +408,29 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
+            let in_key_down = self.ivars().in_key_down.get();
+
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
+                if in_key_down {
+                    self.ivars().ime_state.set(ImeState::Committed);
+                } else {
+                    // Not driven by a key press (e.g. dictation), so there is no following key
+                    // event to swallow; go straight back to the ground state.
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.ivars().ime_state.set(ImeState::Ground);
+                }
+            } else if !in_key_down && self.ivars().ime_allowed.get() && !is_control {
+                // Text inserted without a key press or a composition: macOS dictation, the
+                // Character Viewer, text services. No `KeyboardInput` will carry it, so commit it.
+                if self.ivars().ime_state.get() == ImeState::Disabled {
+                    *self.ivars().input_source.borrow_mut() = self.current_input_source();
+                    self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                    self.ivars().ime_state.set(ImeState::Ground);
+                }
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
             }
         }
 
@@ -459,7 +484,9 @@ declare_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                self.ivars().in_key_down.set(true);
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                self.ivars().in_key_down.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -797,6 +824,7 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            in_key_down: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
